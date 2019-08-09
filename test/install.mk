@@ -5,47 +5,66 @@
 
 INSTALL_OPTS="--set global.istioNamespace=${ISTIO_CONTROL_NS} --set global.configNamespace=${ISTIO_CONTROL_NS} --set global.telemetryNamespace=${ISTIO_TELEMETRY_NS} --set global.policyNamespace=${ISTIO_POLICY_NS}"
 
-ENABLE_NAMESPACES_BY_DEFAULT ?= true
-
 # Verify each component can be generated. If "ONE_NAMESPACE" is set to 1, then create pre-processed yaml files with the defaults
 # all in "istio-control" namespace, otherwise, create pre-processed yaml in isolated namespaces for different components.
 # TODO: minimize 'ifs' in templates, and generate alternative files for cases we can't remove. The output could be
 # used directly with kubectl apply -f https://....
 # TODO: Add a local test - to check various things are in the right place (jsonpath or equivalent)
 # TODO: run a local etcd/apiserver and verify apiserver accepts the files
-run-build:  dep run-build-demo run-build-multi run-build-micro
+run-build:  dep run-build-cluster run-build-demo run-build-micro run-build-minimal run-build-citadel run-build-default run-build-canary
 
-run-build-multi:
+# Kustomization for cluster-wide resources. Must be used as first step ( if old installer was used - this might not be
+# required).
+run-build-cluster:
+	bin/iop istio-system cluster ${BASE}/crds -t > kustomize/cluster/gen-crds-namespace.yaml
 
-	bin/iop ${ISTIO_SYSTEM_NS} istio-system-security ${BASE}/security/citadel -t --set kustomize=true > kustomize/citadel/citadel.yaml
+# Micro profile - just pilot and ingress, in a separate namespace.
+# This can be used side-by-side with istio-system. For example knative uses a similar config as ingress while allowing
+# full istio to run at the same time.
+run-build-micro: run-build-cluster
+	# No longer used, minimal matching original istio.
 
-	bin/iop ${ISTIO_CONTROL_NS} istio-config ${BASE}/istio-control/istio-config -t > kustomize/istio-control/istio-config.yaml
-	bin/iop ${ISTIO_CONTROL_NS} istio-discovery ${BASE}/istio-control/istio-discovery -t > kustomize/istio-control/discovery/discovery.yaml
-	bin/iop ${ISTIO_CONTROL_NS} istio-autoinject ${BASE}/istio-control/istio-autoinject -t > kustomize/istio-control/istio-autoinject.yaml
-
-	bin/iop ${ISTIO_INGRESS_NS} istio-ingress ${BASE}/gateways/istio-ingress -t > kustomize/istio-ingress/istio-ingress.yaml
-
-	bin/iop ${ISTIO_TELEMETRY_NS} istio-telemetry ${BASE}/istio-telemetry/mixer-telemetry -t > kustomize/istio-telemetry/mixer-telemetry.yaml
-	bin/iop ${ISTIO_TELEMETRY_NS} istio-telemetry ${BASE}/istio-telemetry/prometheus -t > kustomize/istio-telemetry/istio-prometheus.yaml
-	bin/iop ${ISTIO_TELEMETRY_NS} istio-telemetry ${BASE}/istio-telemetry/grafana -t > kustomize/istio-telemetry/istio-grafana.yaml
-
-	#bin/iop ${ISTIO_POLICY_NS} istio-policy ${BASE}/istio-policy -t > ${OUT}/release/multi/istio-policy.yaml
-	#bin/iop ${ISTIO_POLICY_NS} istio-cni ${BASE}/istio-cni -t > ${OUT}/release/multi/istio-cni.yaml
-	# TODO: generate single config (merge all yaml)
-	# TODO: different common user-values combinations
-	# TODO: apply to a local kube apiserver to validate against k8s
-	# Short term: will be checked in - for testing apply -k
-
-run-build-micro:
-	bin/iop istio-micro istio-discovery ${BASE}/istio-control/istio-discovery  -t \
+# Minimal profile. Similar with minimal profile in old installer
+run-build-minimal:
+	bin/iop istio-system istio-discovery ${BASE}/istio-control/istio-discovery  -t \
 	  --set global.controlPlaneSecurityEnabled=false \
 	  --set pilot.useMCP=false \
-	  --set pilot.plugins="health" > kustomize/micro/discovery.yaml
+	  --set pilot.plugins="health" > kustomize/minimal/gen-discovery.yaml
+
+# Generate config for ingress matching minimal profie. Runs in istio-system.
+run-build-ingress:
+	bin/iop istio-system istio-ingress ${BASE}/gateways/istio-ingress  -t \
+	  --set global.istioNamespace=istio-system \
+	  --set global.controlPlaneSecurityEnabled=false \
+      > kustomize/istio-ingress/gen-istio-ingress.yaml
+
+	# Required since we can't yet kustomize the CLI ( need to switch to viper and env first )
 	bin/iop istio-micro istio-ingress ${BASE}/gateways/istio-ingress  -t \
 	  --set global.istioNamespace=istio-micro \
-      --set global.controlPlaneSecurityEnabled=false \
-      > kustomize/micro/istio-ingress.yaml
+	  --set global.controlPlaneSecurityEnabled=false \
+      > test/knative/gen-istio-ingress.yaml
 
+run-build-citadel:
+	bin/iop ${ISTIO_SYSTEM_NS} istio-system-security ${BASE}/security/citadel -t --set kustomize=true > kustomize/citadel/citadel.yaml
+
+# A canary pilot, to be used for testing config changes in pilot.
+run-build-canary: run-build-cluster
+	# useMCP is false because Galley with old installer uses the DNS cert, which is hard to manage.
+	# In operator/new installer galley MCP side has a sidecar and uses normal spiffe: cert.
+	bin/iop ${ISTIO_SYSTEM_NS} pilot-canary istio-control/istio-discovery -t \
+    		--set pilot.useMCP=false \
+    	  	--set clusterResources=false \
+    		--set version=canary > kustomize/istio-canary/gen-discovery.yaml
+
+run-build-default: dep
+	bin/iop ${ISTIO_SYSTEM_NS} istio ${BASE}/security/citadel -t > kustomize/default/gen-istio-citadel.yaml
+	bin/iop ${ISTIO_SYSTEM_NS} istio ${BASE}/istio-control/istio-config  -t > kustomize/default/gen-istio-config.yaml
+	bin/iop ${ISTIO_SYSTEM_NS} istio ${BASE}/istio-control/istio-discovery -t > kustomize/default/gen-istio-discovery.yaml
+	bin/iop ${ISTIO_SYSTEM_NS} istio ${BASE}/istio-control/istio-autoinject  -t > kustomize/default/gen-istio-autoinject.yaml
+	bin/iop ${ISTIO_SYSTEM_NS} istio ${BASE}/gateways/istio-ingress -t > kustomize/default/gen-istio-ingress.yaml
+	bin/iop ${ISTIO_SYSTEM_NS} istio ${BASE}/istio-telemetry/mixer-telemetry -t > kustomize/default/gen-istio-telemetry.yaml
+	bin/iop ${ISTIO_SYSTEM_NS} istio ${BASE}/istio-telemetry/prometheus  -t > kustomize/default/gen-istio-prometheus.yaml
+	bin/iop ${ISTIO_SYSTEM_NS} istio ${BASE}/istio-telemetry/grafana -t > kustomize/default/gen-istio-grafana.yaml
 
 
 DEMO_OPTS="-f test/demo/values.yaml"
@@ -55,15 +74,16 @@ DEMO_OPTS="-f test/demo/values.yaml"
 run-build-demo: dep
 	mkdir -p ${OUT}/release/demo
 
-	bin/iop ${ISTIO_SYSTEM_NS} istio-citadel ${BASE}/security/citadel -t ${DEMO_OPTS} > ${OUT}/release/demo/istio-citadel.yaml
-	bin/iop ${ISTIO_SYSTEM_NS} istio-config ${BASE}/istio-control/istio-config -t ${DEMO_OPTS} > ${OUT}/release/demo/istio-config.yaml
-	bin/iop ${ISTIO_SYSTEM_NS} istio-discovery ${BASE}/istio-control/istio-discovery -t ${DEMO_OPTS} > ${OUT}/release/demo/istio-discovery.yaml
-	bin/iop ${ISTIO_SYSTEM_NS} istio-autoinject ${BASE}/istio-control/istio-autoinject -t ${DEMO_OPTS} --set sidecarInjectorWebhook.enableNamespacesByDefault=${ENABLE_NAMESPACES_BY_DEFAULT} > ${OUT}/release/demo/istio-autoinject.yaml
-	bin/iop ${ISTIO_SYSTEM_NS} istio-ingress ${BASE}/gateways/istio-ingress -t ${DEMO_OPTS} > ${OUT}/release/demo/istio-ingress.yaml
-	bin/iop ${ISTIO_SYSTEM_NS} istio-egress ${BASE}/gateways/istio-egress -t ${DEMO_OPTS} > ${OUT}/release/demo/istio-egress.yaml
-	bin/iop ${ISTIO_SYSTEM_NS} istio-telemetry ${BASE}/istio-telemetry/mixer-telemetry -t ${DEMO_OPTS} > ${OUT}/release/demo/istio-telemetry.yaml
-	bin/iop ${ISTIO_SYSTEM_NS} istio-telemetry ${BASE}/istio-telemetry/prometheus -t ${DEMO_OPTS} > ${OUT}/release/demo/istio-prometheus.yaml
-	bin/iop ${ISTIO_SYSTEM_NS} istio-telemetry ${BASE}/istio-telemetry/grafana -t ${DEMO_OPTS} > ${OUT}/release/demo/istio-grafana.yaml
+	rm ${OUT}/release/demo/* || true
+	bin/iop ${ISTIO_SYSTEM_NS} istio ${BASE}/security/citadel -t ${DEMO_OPTS} > ${OUT}/release/demo/istio-citadel.yaml
+	bin/iop ${ISTIO_SYSTEM_NS} istio ${BASE}/istio-control/istio-config -t ${DEMO_OPTS} > ${OUT}/release/demo/istio-config.yaml
+	bin/iop ${ISTIO_SYSTEM_NS} istio ${BASE}/istio-control/istio-discovery -t ${DEMO_OPTS} > ${OUT}/release/demo/istio-discovery.yaml
+	bin/iop ${ISTIO_SYSTEM_NS} istio ${BASE}/istio-control/istio-autoinject -t ${DEMO_OPTS} --set sidecarInjectorWebhook.enableNamespacesByDefault=${ENABLE_NAMESPACES_BY_DEFAULT} > ${OUT}/release/demo/istio-autoinject.yaml
+	bin/iop ${ISTIO_SYSTEM_NS} istio ${BASE}/gateways/istio-ingress -t ${DEMO_OPTS} > ${OUT}/release/demo/istio-ingress.yaml
+	bin/iop ${ISTIO_SYSTEM_NS} istio ${BASE}/gateways/istio-egress -t ${DEMO_OPTS} > ${OUT}/release/demo/istio-egress.yaml
+	bin/iop ${ISTIO_SYSTEM_NS} istio ${BASE}/istio-telemetry/mixer-telemetry -t ${DEMO_OPTS} > ${OUT}/release/demo/istio-telemetry.yaml
+	bin/iop ${ISTIO_SYSTEM_NS} istio ${BASE}/istio-telemetry/prometheus -t ${DEMO_OPTS} > ${OUT}/release/demo/istio-prometheus.yaml
+	bin/iop ${ISTIO_SYSTEM_NS} istio ${BASE}/istio-telemetry/grafana -t ${DEMO_OPTS} > ${OUT}/release/demo/istio-grafana.yaml
 	# bin/iop ${ISTIO_SYSTEM_NS} istio-policy ${BASE}/istio-policy -t > ${OUT}/release/demo/istio-policy.yaml
 	cat ${OUT}/release/demo/*.yaml > test/demo/k8s.yaml
 
@@ -99,7 +119,7 @@ install-base: install-crds
 	# Autoinject global enabled - we won't be able to install injector
 	kubectl label ns ${ISTIO_SYSTEM_NS} istio-injection=disabled --overwrite
 	bin/iop ${ISTIO_SYSTEM_NS} istio-system-security ${BASE}/security/citadel ${IOP_OPTS} ${INSTALL_OPTS}
-	kubectl wait deployments istio-citadel11 -n ${ISTIO_SYSTEM_NS} --for=condition=available --timeout=${WAIT_TIMEOUT}
+	kubectl wait deployments istio-citadel -n ${ISTIO_SYSTEM_NS} --for=condition=available --timeout=${WAIT_TIMEOUT}
 	kubectl create ns ${ISTIO_CONTROL_NS} || true
 	kubectl label ns ${ISTIO_CONTROL_NS} istio-injection=disabled --overwrite
 	bin/iop ${ISTIO_CONTROL_NS} istio-config ${BASE}/istio-control/istio-config ${IOP_OPTS} ${INSTALL_OPTS}
@@ -117,6 +137,14 @@ install-ingress:
 	kubectl label ns ${ISTIO_INGRESS_NS} istio-injection=disabled --overwrite
 	bin/iop ${ISTIO_INGRESS_NS} istio-ingress ${BASE}/gateways/istio-ingress  ${IOP_OPTS} ${INSTALL_OPTS}
 	kubectl wait deployments istio-ingressgateway -n ${ISTIO_INGRESS_NS} --for=condition=available --timeout=${WAIT_TIMEOUT}
+
+wait-all-system:
+	kubectl wait deployments istio-citadel -n ${ISTIO_SYSTEM_NS} --for=condition=available --timeout=${WAIT_TIMEOUT}
+	kubectl wait deployments istio-galley istio-pilot -n ${ISTIO_SYSTEM_NS} --for=condition=available --timeout=${WAIT_TIMEOUT}
+	kubectl wait deployments istio-sidecar-injector -n ${ISTIO_SYSTEM_NS} --for=condition=available --timeout=${WAIT_TIMEOUT}
+	kubectl wait deployments istio-ingressgateway -n ${ISTIO_SYSTEM_NS} --for=condition=available --timeout=${WAIT_TIMEOUT}
+	kubectl wait deployments istio-telemetry prometheus grafana -n ${ISTIO_SYSTEM_NS} --for=condition=available --timeout=${WAIT_TIMEOUT}
+
 
 install-egress:
 	kubectl create ns ${ISTIO_EGRESS_NS} || true
